@@ -1735,3 +1735,159 @@ nadmiarowe — wystarczy funkcja której referencję przekazujesz do `dependency
 
 Gdyby fake credential potrzebował danych z bazy albo z innej fixture — wtedy
 warto by go zrobić fixture i wstrzyknąć do `client_fastapi`/`client_httpx`.
+
+## Lintowanie, formatowanie i typy — ruff, mypy, pre-commit
+
+**Ruff** robi lintowanie (`ruff check`) i formatowanie (`ruff format`). **Mypy** tylko sprawdza typy
+i nie formatuje kodu. Konfigurację obu narzędzi trzymamy w `pyproject.toml`
+(`[tool.ruff]`, `[tool.mypy]`), a sprawdzamy `src` i `tests`.
+
+### Kiedy uruchamiać narzędzia — opcje
+
+| Opcja | Kiedy działa | Zalety | Wady |
+|---|---|---|---|
+| **Ręcznie** | Gdy wpiszesz `uv run ruff check`, `uv run ruff format`, `uv run mypy src tests` | Zero konfiguracji | Łatwo zapomnieć |
+| **Skrypty / taski** | Jedno polecenie, np. `uv run poe check` albo `Makefile` | Jedna komenda zamiast trzech | Nadal uruchamiasz ręcznie |
+| **Git hook (`pre-commit`)** | Automatycznie przy każdym `git commit` | Złego kodu nie da się zacommitować, konfiguracja wersjonowana w repo | Trochę konfiguracji, commit trwa dłużej |
+| **Ręczny skrypt w `.git/hooks`** | Przy commicie | Bez dodatkowych zależności | Nie trafia do repo, nie da się współdzielić |
+| **CI (np. GitHub Actions)** | Po pushu na serwerze | Nie da się obejść przez `--no-verify` | Feedback dopiero po pushu |
+| **Edytor / IDE** | Przy zapisie pliku | Najszybszy feedback | Zależy od ustawień każdego developera |
+
+Dobre połączenie: hook lokalnie (szybki feedback) plus CI jako bezpiecznik.
+
+### Czym jest `pre-commit`
+
+**`pre-commit`** to narzędzie napisane w Pythonie (pakiet z PyPI, instalowany jak `pytest` czy
+`ruff`), które zarządza hookami gita. Samo nie sprawdza kodu — uruchamia inne narzędzia (tu ruff
+i mypy) w odpowiednim momencie.
+
+**Framework, nie biblioteka:** to ono steruje przebiegiem (czyta konfigurację, wybiera pliki,
+uruchamia hooki, decyduje o przerwaniu commita), a Ty podajesz tylko listę narzędzi.
+
+Git pozwala podpiąć dowolny skrypt pod commit (`.git/hooks/pre-commit`), ale niczego więcej nie
+daje. Pisząc taki skrypt ręcznie, trzeba samemu obsłużyć listę zmienionych plików, kolejność,
+kody wyjścia i współdzielenie z zespołem (`.git/hooks` nie trafia do repo). `pre-commit` robi to
+za nas:
+
+- czyta konfigurację z `.pre-commit-config.yaml` i uruchamia hooki po kolei,
+- przekazuje im zmienione pliki i filtruje je po typie (`types: [python]`) lub ścieżce (`files`),
+- przerywa commit, jeśli którykolwiek hook zwróci błąd albo zmodyfikuje pliki,
+- zarządza środowiskami zewnętrznych hooków (przy hookach `local` nie jest to potrzebne).
+
+#### `.pre-commit-config.yaml` a `.git/hooks`
+
+- **`.pre-commit-config.yaml`** to tylko konfiguracja: lista poleceń, plików i kolejność. Leży
+  w katalogu głównym projektu i jest zwykłym plikiem w repo (commitujemy go).
+- **`.git/hooks/pre-commit`** to mały skrypt-wrapper, który zapisuje komenda
+  `pre-commit install`. Nie zawiera reguł, tylko woła `pre-commit run`, a ten czyta YAML.
+
+Przebieg: `git commit` → uruchamia `.git/hooks/pre-commit` → wywołuje `pre-commit run` → czyta
+`.pre-commit-config.yaml` → uruchamia hooki. Zmiany w YAML działają od razu, bez ponownej
+instalacji.
+
+**Konsekwencja:** `.git/hooks` nie jest wersjonowane, więc po sklonowaniu repo na nowej maszynie
+trzeba raz uruchomić `uv run pre-commit install`. Sam YAML przyjedzie z repo.
+
+#### Najczęściej używane komendy
+
+| Komenda | Co robi |
+|---|---|
+| `pre-commit install` | Podpina hook pod git (raz na klon repo) |
+| `pre-commit run --all-files` | Odpala wszystkie hooki na całym projekcie, nie tylko na zmienionych plikach |
+| `pre-commit run <id>` | Odpala jeden hook po jego `id`, np. `ruff-check` |
+| `pre-commit uninstall` | Usuwa hook z gita |
+
+### Git hook z `pre-commit` — jak to zrealizować
+
+1. W `pyproject.toml`: dodać `pre-commit` do grupy dev oraz sekcje `[tool.ruff]`,
+   `[tool.ruff.lint]` i `[tool.mypy]`.
+2. Utworzyć `.pre-commit-config.yaml` z trzema hookami w tej kolejności:
+   - `ruff check --fix` (lintowanie z autofixem),
+   - `ruff format` (formatowanie),
+   - `mypy` (typy; ścieżki bierze z `files` w `[tool.mypy]`).
+3. Zainstalować hook w gicie: `uv run pre-commit install`.
+4. Dodać pusty `tests/__init__.py` — mypy odmawia pracy na katalogu bez plików `.py`.
+5. Sprawdzić całość: `uv run pre-commit run --all-files`.
+
+Hooki są typu `local` z `uv run`, żeby używać wersji z `uv.lock`, a mypy widział zainstalowane
+zależności projektu (gotowy mirror mypy działa w izolowanym środowisku).
+
+```yaml
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --fix
+        language: system
+        types: [python]
+        files: ^(src|tests)/
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types: [python]
+        files: ^(src|tests)/
+      - id: mypy
+        name: mypy
+        entry: uv run mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+```
+
+`pass_filenames: false` przy mypy: nie przekazujemy zmienionych plików, więc mypy sprawdza cały
+projekt (`files = ["src", "tests"]` z `pyproject.toml`). Ma to znaczenie, bo błąd typów może
+wynikać ze zmiany w innym pliku. Kolejność hooków też jest ważna: `ruff check --fix` przed
+`ruff format` (autofix może zmienić formatowanie), a mypy na końcu, bo działa na gotowym kodzie.
+
+**Autofix:** `ruff check --fix` i `ruff format` modyfikują pliki. Gdy coś zmienią, commit jest
+przerwany — robisz `git add` i commit jeszcze raz. To normalne zachowanie pre-commit.
+Hook można pominąć przez `git commit --no-verify`.
+
+Testów (`pytest`) zwykle nie wpina się w hook commita, bo spowalniają pracę — lepiej na
+`pre-push` albo do CI.
+
+### Mypy w trybie strict
+
+```toml
+[tool.mypy]
+strict = true
+files = ["src", "tests"]
+```
+
+`strict` włącza m.in. wymóg adnotacji we wszystkich funkcjach, zakaz niejawnego `Any` i
+sprawdzanie ciał funkcji bez typów. W testach oznacza to `def test_add_stock() -> None:` oraz
+adnotacje fixture'ów, np. `def product() -> Product:`.
+
+### Reguły ruff
+
+Reguły są pogrupowane w zestawy oznaczone literami i włączane przez `select`:
+
+```toml
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "PT"]
+```
+
+| Kod | Nazwa | Co sprawdza |
+|---|---|---|
+| **E, W** | pycodestyle | Styl PEP 8: spacje, wcięcia, zbyt długie linie |
+| **F** | pyflakes | Prawdziwe błędy: nieużywane importy i zmienne, niezdefiniowane nazwy |
+| **I** | isort | Sortowanie i grupowanie importów |
+| **B** | bugbear | Typowe pułapki, np. mutowalny argument domyślny `def f(x=[])` |
+| **UP** | pyupgrade | Nowoczesna składnia, np. `list[int]` zamiast `List[int]` |
+| **SIM** | simplify | Upraszczanie kodu, np. `if x: return True else: return False` |
+| **C4** | comprehensions | Lepsze listy składane zamiast `list(map(...))` |
+| **PT** | flake8-pytest-style | Konwencje pytesta: `pytest.raises` z `match=`, nazwy w `parametrize` |
+
+- `PT` jest szczególnie przydatny przy nauce pytesta — wskazuje niezalecany styl, np.
+  `pytest.raises(ValueError)` bez `match`.
+- Domyślnie ruff włącza tylko `E` (część) i `F`.
+- Autofixowalne są m.in. `F` (nieużywane importy), `I`, `UP`, `C4` i część `SIM`. Reguły `B` i `E`
+  zwykle tylko zgłaszają problem.
+- Na początek bez `D` (docstringi) i `ANN` (adnotacje — to robi już mypy), bo zasypałyby
+  błędami.
+- Domyślna długość linii w ruff to 88 znaków (jak w black); powyżej ustawione 100.

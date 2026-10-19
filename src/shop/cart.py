@@ -4,7 +4,7 @@ from src.shop.product import Product
 class Cart:
     """A shopping cart holding products and their quantities."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.items: dict[str, tuple[Product, int]] = {}
 
     def add(self, product: Product, quantity: int = 1) -> None:
