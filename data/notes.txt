@@ -1,0 +1,6 @@
+# Shop notes - lines starting with '#' are comments
+
+Free shipping above 100.
+   Gold status from 1000 points.
+
+# end of file

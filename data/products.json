@@ -1,0 +1,5 @@
+[
+  {"name": "Battery", "price": "10.25", "stock": "5"},
+  {"name": "Cable", "price": "4.99", "stock": "20"},
+  {"name": "Lamp", "price": "24.50"}
+]

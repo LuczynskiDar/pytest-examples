@@ -954,10 +954,309 @@ Asercje na wywołaniach mają sens gdy **efektem ubocznym** funkcji jest wywoła
 zależności — np. zapis do bazy, wysłanie emaila, zapis do pliku. Weryfikujesz wtedy
 nie tylko wynik (`return`) ale też że kod faktycznie wykonał oczekiwaną operację.
 
+### Mockowanie zależności wstrzykiwanych przez konstruktor
+
+Gdy klasa dostaje swoje zależności w konstruktorze (`OrderService(gateway, notifier)`), nie
+potrzebujesz `patch` — wystarczy przekazać mock zamiast prawdziwego obiektu.
+
+```python
+from unittest.mock import create_autospec
+
+@pytest.fixture
+def gateway() -> PaymentGateway:
+    mock = create_autospec(PaymentGateway, instance=True)
+    mock.charge.return_value = "tx-1"
+    return mock
+```
+
+**`create_autospec(Klasa, instance=True)` zamiast `Mock(spec=Klasa)`:**
+
+| | `Mock(spec=Klasa)` | `create_autospec(Klasa, instance=True)` |
+|---|---|---|
+| Odrzuca nieistniejące metody i atrybuty | tak | tak |
+| Sprawdza **sygnaturę** wywołań (liczbę i nazwy argumentów) | nie | tak |
+| Typ widziany przez mypy | `Mock` — niezgodny z parametrem `PaymentGateway` | `Any` — przechodzi |
+
+Autospec łapie błędy w teście, np. `gateway.charge(1, 2, 3)` przy metodzie z dwoma argumentami, a
+przy okazji nie wymaga `cast` w trybie mypy strict.
+
+> Atrybuty ustawiane w `__init__` (np. `base_url`) nie należą do klasy, więc `spec` ich nie widzi
+> — odwołanie do nich w mocku rzuci `AttributeError`. Ustaw je ręcznie albo mockuj tylko metody.
+
+**Scenariusze dla `OrderService.checkout`:**
+
+```python
+def test_checkout_happy_path(gateway, notifier, order) -> None:
+    service = OrderService(gateway, notifier)
+
+    assert service.checkout(order) == "tx-1"
+    gateway.charge.assert_called_once_with(order.total(), order.customer.email)
+    notifier.send_order_confirmation.assert_called_once_with(order)
+    assert order.status == "paid"
+
+
+def test_checkout_payment_failure(gateway, notifier, order) -> None:
+    gateway.charge.side_effect = PaymentError("Payment declined: no funds")
+
+    with pytest.raises(PaymentError, match="declined"):
+        OrderService(gateway, notifier).checkout(order)
+
+    assert order.status == "new"                          # zamówienie nietknięte
+    notifier.send_order_confirmation.assert_not_called()  # nic nie wysłano
+```
+
+Test **błędu zależności** sprawdza trzy rzeczy: że wyjątek propaguje, że stan obiektu się nie
+zmienił i że kolejne kroki (powiadomienie) się nie wykonały.
+
+### Mockowanie wywołania z menedżerem kontekstu (`with ... as`)
+
+`urlopen` i `smtplib.SMTP` są używane jako `with urlopen(...) as response:`. `MagicMock`
+obsługuje `__enter__` i `__exit__`, ale obiekt użyty w `with` to **`return_value.__enter__.return_value`**,
+a nie sam mock:
+
+```python
+@patch("src.shop.payment.urlopen")
+def test_charge_approved(mock_urlopen: MagicMock) -> None:
+    response = mock_urlopen.return_value.__enter__.return_value
+    response.read.return_value = b'{"status": "approved", "transaction_id": "tx-1"}'
+
+    gateway = PaymentGateway("https://pay.example.com", "secret")
+
+    assert gateway.charge(25.0, "anna@example.com") == "tx-1"
+```
+
+- `patch("src.shop.payment.urlopen")` — patchujemy tam, gdzie nazwa jest **używana**
+  (`payment.py` robi `from urllib.request import urlopen`).
+- `json.load(response)` woła `response.read()`, więc wystarczy ustawić `read.return_value` na bajty.
+
+**Sprawdzanie, co zostało wysłane** — pierwszy argument `urlopen` to obiekt `Request`:
+
+```python
+request = mock_urlopen.call_args.args[0]
+
+assert request.full_url == "https://pay.example.com/charges"
+assert request.get_method() == "POST"
+assert request.get_header("Authorization") == "Bearer secret"
+assert json.loads(request.data) == {"amount": 25.0, "email": "anna@example.com"}
+assert mock_urlopen.call_args.kwargs["timeout"] == 5.0
+```
+
+Nagłówki są zapisywane z pierwszą wielką literą i resztą małych (`Content-type`), więc
+`get_header("Content-Type")` zwróci `None` — użyj `get_header("Content-type")`.
+
+**Błąd sieci:** `side_effect` z wyjątkiem zamiast `return_value`:
+
+```python
+mock_urlopen.side_effect = URLError("connection refused")
+with pytest.raises(PaymentError, match="unavailable"):
+    gateway.charge(25.0, "anna@example.com")
+```
+
+**Walidacja przed wywołaniem:** gdy kod odrzuca dane zanim sięgnie do sieci, sprawdź
+`mock_urlopen.assert_not_called()`.
+
+**SMTP:**
+
+```python
+@patch("src.shop.notifications.smtplib.SMTP")
+def test_send(mock_smtp: MagicMock) -> None:
+    EmailNotifier("smtp.example.com", 587).send("anna@example.com", "Hi", "Body")
+
+    mock_smtp.assert_called_once_with("smtp.example.com", 587)
+    server = mock_smtp.return_value.__enter__.return_value
+    message = server.send_message.call_args.args[0]
+    assert message["To"] == "anna@example.com"
+    assert message["Subject"] == "Hi"
+```
+
+### Dodatkowe informacje o wywołaniach mocka
+
+| Atrybut | Co zwraca |
+|---|---|
+| `mock.call_args` | ostatnie wywołanie; `.args` (krotka) i `.kwargs` (słownik) |
+| `mock.call_args_list` | lista wszystkich wywołań |
+| `mock.call_count` | liczba wywołań |
+| `mock.assert_has_calls([call(1), call(2)])` | wywołania z tymi argumentami, w tej kolejności |
+| `mock.reset_mock()` | czyści historię wywołań |
+
+`call_args.args[0]` jest potrzebne, gdy argumentem jest obiekt zbudowany wewnątrz testowanego
+kodu (jak `Request` czy `EmailMessage`) — nie możesz go porównać `assert_called_once_with`, bo nie
+masz do niego referencji.
+
+### Sprawdzanie logów — `caplog`
+
+Kod, który **łapie błąd i loguje ostrzeżenie** zamiast go przepuszczać, testujesz fixture `caplog`:
+
+```python
+def test_checkout_survives_email_failure(gateway, notifier, order, caplog) -> None:
+    notifier.send_order_confirmation.side_effect = smtplib.SMTPException("server down")
+
+    with caplog.at_level(logging.WARNING):
+        transaction_id = OrderService(gateway, notifier).checkout(order)
+
+    assert transaction_id == "tx-1"
+    assert order.status == "paid"
+    assert f"Could not send confirmation to {order.customer.email}" in caplog.messages
+```
+
+- `caplog.messages` — lista sformatowanych komunikatów, `caplog.records` — pełne obiekty
+  (poziom, nazwa loggera).
+- `caplog.at_level(...)` ustawia poziom na czas bloku; bez niego ostrzeżenia mogą nie trafić do
+  przechwytywania, zależnie od konfiguracji.
+
 ### Złota zasada mockowania
 
 Mockuj na granicy systemu — tam gdzie Twój kod "wychodzi na zewnątrz".
 Nie mockuj wewnętrznych funkcji swojego własnego kodu.
+
+---
+
+## Testowanie wczytywania plików (txt, json, csv)
+
+### Zasada: prawdziwy plik w `tmp_path`, nie mock
+
+Dla kodu czytającego pliki najlepiej utworzyć **prawdziwy plik** w katalogu tymczasowym. Test
+sprawdza wtedy też obsługę kodowania, nowych linii i błędów systemu plików, a nie tylko Twoje założenia.
+`tmp_path` to `pathlib.Path` unikalny dla testu i sprzątany automatycznie.
+
+```python
+def test_read_lines_skips_comments_and_blanks(tmp_path: Path) -> None:
+    file = tmp_path / "notes.txt"
+    file.write_text("# comment\n\nfirst\n  second  \n", encoding="utf-8")
+
+    assert read_lines(file) == ["first", "second"]
+```
+
+> **Zawsze podawaj `encoding="utf-8"` przy zapisie.** Bez niego `write_text` używa kodowania
+> systemowego (na Windows zwykle cp1252), a `read_text(encoding="utf-8")` w testowanym kodzie
+> przeczyta inne bajty — test przejdzie lub padnie zależnie od systemu.
+
+Na Windows `write_text` zamienia `\n` na `\r\n`. Jeśli potrzebujesz dokładnych bajtów, użyj
+`write_bytes(b"...")` albo `write_text(..., newline="\n")`.
+
+### Fixture z gotowym plikiem
+
+Gdy kilka testów potrzebuje tego samego pliku, zrób z niego fixture:
+
+```python
+@pytest.fixture
+def products_csv(tmp_path: Path) -> Path:
+    file = tmp_path / "products.csv"
+    file.write_text("name,price,stock\nBattery,10.25,5\nCable,4.99,\n", encoding="utf-8")
+    return file
+
+
+def test_load_from_csv(products_csv: Path) -> None:
+    products = ProductImporter().load_from_csv(products_csv)
+
+    assert [(p.name, p.price, p.stock) for p in products] == [("Battery", 10.25, 5), ("Cable", 4.99, 0)]
+```
+
+### Co testować przy każdym formacie
+
+| Format | Przypadki |
+|---|---|
+| **txt** | pusty plik, same komentarze i puste linie, białe znaki na końcach, znaki spoza ASCII, brak pliku |
+| **json** | poprawny obiekt i lista, niepoprawny JSON (`match="Invalid JSON"`), pusty plik, zły typ danych na górze (obiekt zamiast listy) |
+| **csv** | poprawny plik, tylko nagłówek (zwraca `[]`), pusty plik, brakująca kolumna, inny separator (`;`), pusty element (np. brak `stock`), niepoprawna liczba |
+
+Brak pliku to `FileNotFoundError`, którego kod nie przechwytuje, więc test sprawdza po prostu to:
+
+```python
+def test_read_text_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        read_text(tmp_path / "missing.txt")
+```
+
+### `parametrize` dla zawartości plików
+
+Wiele wariantów zawartości w jednym teście:
+
+```python
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        pytest.param("", [], id="empty"),
+        pytest.param("# only comment\n", [], id="only-comments"),
+        pytest.param("a\n\nb\n", ["a", "b"], id="blank-lines"),
+        pytest.param("  a  \n", ["a"], id="whitespace"),
+        pytest.param("zażółć\n", ["zażółć"], id="non-ascii"),
+    ],
+)
+def test_read_lines(tmp_path: Path, content: str, expected: list[str]) -> None:
+    file = tmp_path / "data.txt"
+    file.write_text(content, encoding="utf-8")
+
+    assert read_lines(file) == expected
+```
+
+Jedna funkcja pomocnicza do zapisu pliku zmniejsza powtórzenia, gdy w pliku testów jest ich wiele.
+
+### Błędy w plikach — `pytest.raises` z `match`
+
+```python
+def test_read_json_invalid(tmp_path: Path) -> None:
+    file = tmp_path / "bad.json"
+    file.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Invalid JSON"):
+        read_json(file)
+
+
+def test_read_csv_missing_column(tmp_path: Path) -> None:
+    file = tmp_path / "products.csv"
+    file.write_text("name\nBattery\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Missing columns: price"):
+        read_csv(file, required_columns=("name", "price"))
+```
+
+W `match` nie podawaj pełnej ścieżki do pliku — `tmp_path` jest inny przy każdym uruchomieniu.
+Dopasuj tylko stałą część komunikatu.
+
+### Trzy sposoby odizolowania od dysku
+
+| Sposób | Kiedy | Uwagi |
+|---|---|---|
+| **`tmp_path` + prawdziwy plik** | domyślnie, dla czytników plików | najmniej założeń, działa tak jak w produkcji |
+| **`patch` na funkcji czytającej** | testujesz logikę *nad* czytnikiem (np. `ProductImporter`) | szybki, ale test nie sprawdza integracji z czytnikiem |
+| **`mock_open`** | kod używa wbudowanego `open()` i nie możesz zmienić ścieżki | kruchy: test zależy od tego, *jak* kod czyta plik |
+
+Przykład z `patch` — logika importera bez dotykania dysku:
+
+```python
+@patch("src.shop.importer.read_csv")
+def test_importer_builds_products(mock_read_csv: MagicMock) -> None:
+    mock_read_csv.return_value = [{"name": "Battery", "price": "10.25", "stock": ""}]
+
+    products = ProductImporter().load_from_csv("ignored.csv")
+
+    assert products[0].stock == 0
+    mock_read_csv.assert_called_once_with("ignored.csv", required_columns=("name", "price"))
+```
+
+Test ze `tmp_path` jest jednak pewniejszy. `patch` ma sens, gdy chcesz **wymusić** wynik, który trudno
+uzyskać z prawdziwego pliku, albo przetestować warstwę wyżej niezależnie od niższej.
+
+### Pliki z katalogu `data/`
+
+Przykładowe pliki w `data/` nadają się do **jednego** testu „na prawdziwych danych":
+
+```python
+DATA_DIR = Path(__file__).parents[2] / "data"
+
+def test_load_sample_products() -> None:
+    products = ProductImporter().load_from_csv(DATA_DIR / "products.csv")
+
+    assert len(products) == 3
+```
+
+Ścieżkę buduj względem pliku testowego (`__file__`), a nie względem bieżącego katalogu, bo
+`pytest` można uruchomić z dowolnego miejsca. Testy ze stałymi plikami są jednak powiązane z ich
+zawartością — zmiana pliku psuje test, więc większość przypadków trzymaj w `tmp_path`.
+
+Jeśli kod używa ścieżek względnych, `monkeypatch.chdir(tmp_path)` zmienia bieżący katalog na czas
+testu i przywraca go po jego zakończeniu.
 
 ---
 

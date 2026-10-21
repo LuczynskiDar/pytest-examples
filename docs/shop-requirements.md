@@ -127,6 +127,95 @@ new ──pay()──► paid ──ship()──► shipped
 
 `shipped` and `cancelled` are final states.
 
+## File reading — `src/files/readers.py`
+
+Plain functions, no dependencies. All accept `Path` or `str`. Sample files are in `data/`, but
+tests should mostly create their own with the `tmp_path` fixture.
+
+| Function | Behaviour |
+|---|---|
+| `read_text(path)` | Whole file content as a string (UTF-8). Missing file → `FileNotFoundError` |
+| `read_lines(path)` | Lines stripped of surrounding whitespace; empty lines and lines starting with `#` are skipped |
+| `read_json(path)` | Parsed JSON (any type). Invalid JSON → `ValueError("Invalid JSON in <path>: <reason>")`. Missing file → `FileNotFoundError` |
+| `read_csv(path, delimiter=",", required_columns=())` | List of dicts keyed by the header; every value is a **string**. File with no header → `ValueError("CSV file is empty: <path>")`; missing required columns → `ValueError("Missing columns: a, b")` |
+
+Things worth testing: empty file, file with only comments, header-only CSV (returns `[]`),
+custom delimiter (`;`), non-ASCII characters (UTF-8), a malformed JSON, a missing file.
+
+## Importing products — `src/shop/importer.py`
+
+`ProductImporter` builds `Product` objects from files, using the readers above.
+
+| Method | Behaviour |
+|---|---|
+| `load_from_csv(path)` | CSV with required columns `name`, `price` and optional `stock` (empty or missing → `0`). Missing required column → `ValueError("Missing columns: ...")` |
+| `load_from_json(path)` | JSON list of objects with the same keys (values may be strings or numbers). Not a list → `ValueError("JSON file must contain a list of products")` |
+
+Both methods report an invalid entry as `ValueError("Invalid product in row <n>: <reason>")`,
+where `n` counts data rows from 1. Causes: a non-numeric price or stock, a missing key, a negative
+price or stock (the `Product` validation message is included in `<reason>`).
+
+## Payment — `src/shop/payment.py`
+
+`PaymentGateway(base_url, api_key, timeout=5.0)` talks to an external service over HTTP using
+`urllib.request.urlopen`. **Tests must never make a real request — mock `urlopen`.**
+
+`charge(amount, customer_email) -> str` sends `POST <base_url>/charges` with a JSON body and a
+`Bearer` token, and returns the transaction id.
+
+| Situation | Result |
+|---|---|
+| `amount <= 0` | `ValueError("Amount must be positive")`, no request is made |
+| Response `{"status": "approved", "transaction_id": ...}` | Returns the id as a string |
+| Response with another status | `PaymentError("Payment declined: <reason>")`, reason defaults to `unknown` |
+| `URLError` from `urlopen` | `PaymentError("Payment gateway unavailable")` |
+
+Things to verify with a mock: the `Request` object passed to `urlopen` (URL, method, headers,
+body) and the `timeout` argument.
+
+## Notifications — `src/shop/notifications.py`
+
+`EmailNotifier(host, port=25, sender="shop@example.com")` sends mail through `smtplib.SMTP`.
+**Tests must mock `smtplib.SMTP`.**
+
+| Method | Behaviour |
+|---|---|
+| `send(recipient, subject, body)` | Builds an `EmailMessage` (From, To, Subject, body) and sends it with `send_message` inside a `with smtplib.SMTP(host, port)` block |
+| `send_order_confirmation(order)` | Sends to the customer's e-mail, subject `"Order confirmation"`, body with the customer's name and `order.total()` formatted to 2 decimals |
+
+## Checkout — `src/shop/order_service.py`
+
+`OrderService(gateway, notifier)` combines the pieces. It receives its collaborators through the
+constructor, so they are easy to replace with `Mock` / `MagicMock`.
+
+`checkout(order) -> str`:
+
+1. Order status other than `"new"` → `ValueError("Cannot check out an order with status '<status>'")`;
+   the customer is **not** charged.
+2. Charges `order.total()` for `order.customer.email` through the gateway.
+3. Calls `order.pay()` (stock is reduced, points are added).
+4. Sends the confirmation e-mail. An `smtplib.SMTPException` is **logged** as a warning
+   (`"Could not send confirmation to <email>"`) and does not fail the checkout.
+5. Returns the transaction id.
+
+| Scenario | Expected |
+|---|---|
+| Gateway raises `PaymentError` | The error propagates; order stays `"new"`; notifier is not called |
+| Notifier raises `SMTPException` | Checkout still returns the id; order is `"paid"`; a warning is logged (`caplog`) |
+| Happy path | `gateway.charge` called once with `(order.total(), email)`; `notifier.send_order_confirmation` called once with the order |
+
+## Mocking cheat sheet
+
+| Goal | Tool |
+|---|---|
+| Replace a collaborator passed via the constructor | `Mock()` / `MagicMock()`; `Mock(spec=PaymentGateway)` rejects unknown attributes |
+| Make a call return a value or raise | `mock.charge.return_value = "tx-1"`, `mock.charge.side_effect = PaymentError("...")` |
+| Replace a name used inside a module | `patch("src.shop.payment.urlopen")` — patch where the name is **used**, not where it is defined |
+| Mock a context manager (`with urlopen(...) as r`) | Configure `mock.return_value.__enter__.return_value` |
+| Check calls | `assert_called_once_with(...)`, `assert_not_called()`, `call_args`, `call_count` |
+| Check logging | `caplog` fixture (`caplog.at_level(logging.WARNING)`, `caplog.messages`) |
+| Create files for reader tests | `tmp_path`, then `(tmp_path / "x.csv").write_text(...)` |
+
 ## Known quirks (good test material)
 
 These are the current behaviours of the code. They may be considered bugs or gaps — decide
@@ -152,6 +241,10 @@ Start from the classes with no dependencies and move up:
 2. `Customer` — validation, points, status boundaries.
 3. `Cart` — add/remove/total, using `Product` objects as test data.
 4. `Order` — shipping cost threshold, status transitions, and the side effects of `pay()`.
+5. `readers` — txt, json and csv with files created in `tmp_path`.
+6. `ProductImporter` — real files from `tmp_path`; later, the same with `read_csv` mocked.
+7. `PaymentGateway` and `EmailNotifier` — mock `urlopen` and `smtplib.SMTP`.
+8. `OrderService` — mock the gateway and the notifier; check calls, errors and logging.
 
 Layout:
 
