@@ -165,6 +165,157 @@ def test_imie_uzytkownika(przykladowy_uzytkownik):
 
 Fixture można reużywać w wielu testach — nie duplikujesz kodu przygotowania danych.
 
+#### Fixture z adnotacjami typów (mypy strict)
+
+```python
+@pytest.fixture
+def product() -> Product:
+    return Product("Laptop", 100.0, stock=5)
+
+
+def test_remove_stock(product: Product) -> None:
+    product.remove_stock(2)
+    assert product.stock == 3
+```
+
+- Pytest wstrzykuje fixture **po nazwie argumentu** testu.
+- Domyślnie (`scope="function"`) każdy test dostaje **nową instancję**, więc testy nie
+  wpływają na siebie nawzajem.
+- Fixture współdzieloną między plikami umieść w `tests/conftest.py` — pytest znajduje ją
+  automatycznie, bez importu.
+
+#### Fixture zależna od innej fixture
+
+Fixture może przyjmować inne fixtures jako argumenty. To dobry sposób na budowanie
+obiektów złożonych z prostszych (np. `Order` z `Customer` i `Cart`):
+
+```python
+@pytest.fixture
+def cart(product: Product) -> Cart:
+    cart = Cart()
+    cart.add(product, 2)
+    return cart
+
+
+@pytest.fixture
+def order(customer: Customer, cart: Cart) -> Order:
+    return Order(customer, cart)
+```
+
+#### Sprzątanie przez `yield`
+
+Kod po `yield` wykona się po teście, nawet gdy test padł:
+
+```python
+@pytest.fixture
+def temp_file(tmp_path: Path) -> Iterator[Path]:
+    file = tmp_path / "data.txt"
+    file.write_text("data")
+    yield file
+    file.unlink(missing_ok=True)   # sprzątanie
+```
+
+### `conftest.py` — co w nim umieszczać
+
+`conftest.py` to plik, który pytest **ładuje sam**, bez importu, przed testami z danego katalogu
+i jego podkatalogów. Nazwa musi być dokładnie `conftest.py` (literówka, np. `contest.py`, sprawia,
+że plik jest ignorowany, a fixtures niewidoczne).
+
+#### Co powinno tam być
+
+| Element | Przykład |
+|---|---|
+| **Fixtures współdzielone** między wieloma plikami testów | `product`, `customer`, `cart` |
+| **Hooki pytesta** | `pytest_configure`, `pytest_collection_modifyitems` |
+| **Rejestracja pluginów** | `pytest_plugins = ["..."]` |
+| **Fixtures z `autouse=True`** dla całego katalogu | czyszczenie stanu, ustawienie zmiennej środowiskowej |
+
+```python
+# tests/conftest.py
+import pytest
+
+from src.shop.product import Product
+
+
+@pytest.fixture
+def product() -> Product:
+    return Product("Battery", 10.25, 5)
+```
+
+Test używa fixture po nazwie argumentu, bez żadnego importu:
+
+```python
+def test_is_available(product: Product) -> None:
+    assert product.is_available()
+```
+
+#### Czego tam nie umieszczać
+
+- **Zwykłych funkcji pomocniczych, stałych i aliasów typów** (np. `ProductData = tuple[str, float, int]`),
+  które testy importują ręcznie. Do tego służy osobny moduł, np. `tests/helpers.py`.
+- **Testów** (`test_*`). Pytest ich z `conftest.py` nie zbiera.
+- **Fixtures używanych tylko w jednym pliku.** Trzymaj je w tym pliku, blisko testów, które z nich
+  korzystają.
+- **Logiki biznesowej** albo dużych zestawów danych. Plik ma pozostać krótki i czytelny.
+
+#### Dlaczego nie importować z `conftest.py`
+
+Wzorzec `from tests.conftest import ProductData` jest niezalecany:
+
+- Pytest wczytuje `conftest.py` pod własną nazwą modułu, a ręczny import ładuje go **drugi raz**
+  jako `tests.conftest`. Zależnie od `--import-mode` i obecności `__init__.py` możesz dostać dwa
+  osobne moduły albo błąd importu.
+- Z nazwy `conftest` nie wynika, że definiuje typy lub stałe używane w testach.
+
+Poprawnie: fixtures w `conftest.py` (wstrzykiwane przez pytest), a współdzielone typy i funkcje
+w osobnym module:
+
+```python
+# tests/helpers.py
+ProductData = tuple[str, float, int]
+```
+
+```python
+# tests/unit/test_product.py
+from tests.helpers import ProductData
+```
+
+Alias używany w jednym pliku zostaw w tym pliku i przenieś do `helpers.py` dopiero wtedy,
+gdy będzie potrzebny w drugim.
+
+#### Wiele plików `conftest.py` i zasięg
+
+Pytest szuka `conftest.py` w każdym katalogu na drodze do testu. Fixture jest widoczna dla testów
+w tym katalogu i **wszystkich podkatalogach**, a plik głębiej może ją **nadpisać** fixture o tej samej
+nazwie.
+
+```
+tests/
+├── conftest.py            # fixtures dla całego projektu: product, customer, cart
+├── helpers.py             # wspólne typy i funkcje (importowane ręcznie)
+├── unit/
+│   ├── conftest.py        # opcjonalnie: fixtures tylko dla unit testów
+│   └── test_product.py
+└── integration/
+    ├── conftest.py        # np. fixtures z bazą danych, tylko dla integration
+    └── test_order_flow.py
+```
+
+Zasada: fixture umieszczaj **na najniższym poziomie, który wystarcza**. Używana w jednym pliku
+zostaje w tym pliku, w jednym katalogu trafia do jego `conftest.py`, a w całym projekcie do
+`tests/conftest.py`.
+
+#### Konwencje
+
+- **Nazewnictwo fixtures:** nazwa opisuje to, co fixture zwraca (`product`, `empty_cart`), bez
+  prefiksu `test_`. W pliku z testami pytest wziąłby `test_product` za test.
+- **Adnotacje typów:** fixture zwraca typ obiektu (`-> Product`); przy `yield` używaj
+  `Iterator[T]` lub `Generator[T, None, None]`.
+- **Zakres (`scope`):** domyślny `function` daje świeży obiekt na test. Szerszy zakres
+  (`module`, `session`) tylko dla drogich zasobów, które nie są mutowane.
+- **Jedna odpowiedzialność:** fixture buduje jeden obiekt. Złożone obiekty składaj z mniejszych
+  fixtures (patrz wyżej, „Fixture zależna od innej fixture").
+
 ### Named Tuple w testach
 
 Named tuple to krotka której pola mają nazwy. W testach używana do czytelnego
@@ -246,6 +397,75 @@ def test_dodawanie(a, b, wynik):
 
 Kiedy `parametrize` ma sens — gdy przypadki mają **identyczną strukturę**,
 różnią się tylko wartościami. Gdy asercje różnią się strukturą — lepsze są oddzielne funkcje.
+
+#### Nazwy argumentów jako krotka i adnotacje typów
+
+Z mypy strict każdy parametr testu musi mieć typ. Nazwy argumentów można podać jako krotkę
+(zamiast jednego stringa z przecinkami):
+
+```python
+@pytest.mark.parametrize(
+    ("percent", "expected"),
+    [
+        (0, 100.0),
+        (25, 75.0),
+        (100, 0.0),
+    ],
+)
+def test_apply_discount(percent: float, expected: float) -> None:
+    assert Product("Laptop", 100.0).apply_discount(percent) == expected
+```
+
+#### Czytelne nazwy przypadków — `pytest.param` i `id`
+
+Domyślnie przypadki mają nazwy typu `test_apply_discount[25-75.0]`. Własne `id` poprawia raport:
+
+```python
+@pytest.mark.parametrize(
+    ("percent", "expected"),
+    [
+        pytest.param(0, 100.0, id="no-discount"),
+        pytest.param(25, 75.0, id="quarter"),
+        pytest.param(100, 0.0, id="free"),
+    ],
+)
+def test_apply_discount(percent: float, expected: float) -> None:
+    ...
+```
+
+Pojedynczy przypadek można też oznaczyć markerem, np. `pytest.param(..., marks=pytest.mark.xfail)`.
+
+#### `parametrize` razem z `pytest.raises`
+
+Jeden test dla wielu niepoprawnych danych wejściowych, każda z innym komunikatem:
+
+```python
+@pytest.mark.parametrize(
+    ("price", "stock", "message"),
+    [
+        pytest.param(-1, 0, "Price cannot be negative", id="negative-price"),
+        pytest.param(10, -1, "Stock cannot be negative", id="negative-stock"),
+    ],
+)
+def test_product_invalid_arguments(price: float, stock: int, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        Product("Laptop", price, stock)
+```
+
+#### Wartości graniczne
+
+`parametrize` świetnie nadaje się do testowania granic (testy z obu stron progu):
+
+```python
+@pytest.mark.parametrize(
+    ("points", "status"),
+    [(0, "standard"), (499, "standard"), (500, "silver"), (999, "silver"), (1000, "gold")],
+)
+def test_customer_status(points: int, status: str) -> None:
+    customer = Customer("Anna", "anna@example.com")
+    customer.points = points
+    assert customer.get_status() == status
+```
 
 ### Pułapka — `parametrize` + `patch` jako dekorator
 
@@ -348,6 +568,91 @@ assert exc_info.value.status_code == 415
 assert "not allowed" in exc_info.value.detail
 ```
 
+#### Warianty
+
+**Sam typ wyjątku** — najsłabsza forma, nie sprawdza komunikatu:
+
+```python
+with pytest.raises(ValueError):
+    Product("Laptop", -1)
+```
+
+**`match`** — typ i komunikat. `match` jest **argumentem nazwanym** i działa jak
+`re.search` (szuka dopasowania regex w tekście wyjątku):
+
+```python
+with pytest.raises(ValueError, match="Price cannot be negative"):
+    Product("Laptop", -1)
+```
+
+> Pułapka: `pytest.raises(ValueError, "Price cannot be negative")` (bez `match=`) jest błędem.
+> Drugi argument pozycyjny pytest traktuje jako funkcję do wywołania, więc kończy się
+> `TypeError`, a nie sprawdzeniem komunikatu.
+
+**`as excinfo`** — pełny dostęp do wyjątku, gdy chcesz sprawdzić więcej niż komunikat:
+
+```python
+with pytest.raises(ValueError) as excinfo:
+    Product("Laptop", -1)
+
+assert str(excinfo.value) == "Price cannot be negative"   # dokładne porównanie
+assert excinfo.type is ValueError
+```
+
+Różnica: `match` szuka **podciągu** (regex), a `==` wymaga **dokładnego** tekstu.
+
+**`re.escape`** — gdy komunikat zawiera znaki specjalne regex (`(`, `.`, `?`, `[`):
+
+```python
+with pytest.raises(KeyError, match=re.escape("Laptop is not in the cart")):
+    cart.remove("Laptop")
+```
+
+**Kilka dopuszczalnych wyjątków** — krotka typów:
+
+```python
+with pytest.raises((ValueError, KeyError)):
+    ...
+```
+
+#### Jedna instrukcja w bloku `with`
+
+Wyjątek przerywa blok, więc w środku trzymaj **tylko tę jedną instrukcję**, która ma go rzucić.
+Przygotowanie danych zrób przed blokiem — inaczej nie wiesz, która linia zgłosiła błąd:
+
+```python
+# źle — nie wiadomo, która linia rzuciła ValueError
+with pytest.raises(ValueError):
+    product = Product("Laptop", 10)
+    product.remove_stock(5)
+
+# dobrze
+product = Product("Laptop", 10)
+with pytest.raises(ValueError, match="Not enough stock"):
+    product.remove_stock(5)
+```
+
+#### Typowe błędy w teście z `raises`
+
+- **Pusty blok** (`...` albo `pass` w środku `with`) — nic nie rzuca wyjątku, test pada
+  z `DID NOT RAISE`.
+- **`match` bez nazwy** — patrz pułapka wyżej.
+- **Brak `-> None`** w teście — mypy strict odrzuci commit.
+
+#### Alternatywa: `try/except` + `pytest.fail` (nie polecana)
+
+```python
+try:
+    Product("Laptop", -1)
+except ValueError:
+    pass
+else:
+    pytest.fail("ValueError not raised")
+```
+
+Działa, ale jest dłuższe i mniej czytelne niż `pytest.raises`. Z `unittest` znasz
+`self.assertRaises` — w pytest używamy `pytest.raises`.
+
 ### Stringi
 
 ```python
@@ -391,6 +696,52 @@ Analogiczne do `pytest.raises` ale dla `warnings`:
 with pytest.warns(DeprecationWarning):
     stara_funkcja()
 ```
+
+### `xfail` i `skip` — testy, które mają nie przechodzić albo nie działać
+
+**`xfail`** oznacza test, który **powinien** padać (znany błąd lub niezaimplementowana funkcja).
+Test jest uruchamiany, ale jego porażka nie psuje całego przebiegu:
+
+```python
+@pytest.mark.xfail(reason="Cart ignores quantity already in the cart", strict=True)
+def test_cart_add_checks_total_stock() -> None:
+    product = Product("Laptop", 10, stock=5)
+    cart = Cart()
+    cart.add(product, 3)
+    with pytest.raises(ValueError, match="Not enough stock"):
+        cart.add(product, 3)
+```
+
+Z `strict=True` test zacznie **padać (XPASS → FAILED)**, gdy naprawisz kod. Wtedy wiesz,
+że trzeba zdjąć `xfail`. Bez `strict` taki test zostałby po cichu zaliczony.
+Można też zawęzić do konkretnego wyjątku: `@pytest.mark.xfail(raises=ValueError)`.
+
+**`skip` / `skipif`** — test w ogóle się nie uruchamia:
+
+```python
+@pytest.mark.skip(reason="not implemented yet")
+def test_something() -> None: ...
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX only")
+def test_unix_paths() -> None: ...
+```
+
+| Marker | Test się uruchamia? | Użycie |
+|---|---|---|
+| `xfail` | Tak | Znany błąd, który ma być naprawiony |
+| `skip` | Nie | Funkcja jeszcze nie istnieje |
+| `skipif` | Nie, gdy warunek spełniony | Zależność od systemu lub wersji |
+
+### Inne wbudowane narzędzia pytest
+
+| Narzędzie | Do czego służy |
+|---|---|
+| `monkeypatch` | Podmiana atrybutu, funkcji lub zmiennej środowiskowej na czas testu (`monkeypatch.setattr`, `setenv`). Zmiany cofane automatycznie |
+| `capsys` | Przechwytywanie tego, co kod wypisał przez `print` (`capsys.readouterr().out`) |
+| `tmp_path` | Tymczasowy katalog unikalny dla testu, sprzątany automatycznie |
+| `pytest.mark.<nazwa>` | Własne markery do grupowania testów; trzeba je zarejestrować w `pyproject.toml` (tu: `unit`) |
+
+Uruchamianie wybranych testów po markerze: `pytest -m unit`. Wykluczanie: `pytest -m "not unit"`.
 
 ### Dlaczego pytest nie ma `assertEqual`, `assertIn` itp.?
 
@@ -1859,6 +2210,78 @@ files = ["src", "tests"]
 `strict` włącza m.in. wymóg adnotacji we wszystkich funkcjach, zakaz niejawnego `Any` i
 sprawdzanie ciał funkcji bez typów. W testach oznacza to `def test_add_stock() -> None:` oraz
 adnotacje fixture'ów, np. `def product() -> Product:`.
+
+#### Adnotacje w testach — opcje
+
+Strict wymaga adnotacji **każdego** parametru, nie tylko `-> None`. Dotyczy to też argumentów
+z `parametrize` i fixtures wstrzykiwanych do testu. Brak typu daje błąd
+`Function is missing a type annotation for one or more parameters [no-untyped-def]`.
+
+**Opcja 1: pełne adnotacje (zalecana)** — typ opisuje dane, a mypy łapie błędy, np. po zmianie
+kolejności pól w klasie:
+
+```python
+@pytest.mark.parametrize("invalid_product_data", [("Battery", -10.25, 5)])
+def test_product_negative_price(invalid_product_data: tuple[str, float, int]) -> None:
+    with pytest.raises(ValueError, match="Price cannot be negative"):
+        Product(*invalid_product_data)
+```
+
+Typ fixture to zwykle po prostu typ zwracany: `def product() -> Product:`, a w teście
+`def test_x(product: Product) -> None:`.
+
+**Opcja 2: alias typu** — skraca zapis przy powtarzającym się typie, bez utraty informacji:
+
+```python
+ProductData = tuple[str, float, int]
+
+def test_product_negative_price(invalid_product_data: ProductData) -> None: ...
+```
+
+**Opcja 3: `Any` dla wybranych parametrów** — spełnia wymóg strict, ale niczego nie sprawdza,
+więc to tylko obejście:
+
+```python
+from typing import Any
+
+def test_product_negative_price(invalid_product_data: Any) -> None: ...
+```
+
+**Opcja 4: luźniejsze reguły tylko dla `tests`** — `src` zostaje w pełnym strict:
+
+```toml
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+```
+
+Potrzebne są **obie** opcje: `disallow_untyped_defs` obejmuje funkcje bez żadnych adnotacji,
+a `disallow_incomplete_defs` te z częściowymi, np. `def test(x) -> None`. Reszta strict
+(w tym `check_untyped_defs`) nadal działa — mypy sprawdza ciała testów, ale nieotypowane
+parametry traktuje jako `Any`.
+
+| Opcja | Zaleta | Wada |
+|---|---|---|
+| 1. Pełne adnotacje | Mypy łapie błędy w danych testowych | Trochę pisania |
+| 2. Alias typu | Krótszy zapis, pełna informacja | Dodatkowa nazwa do zapamiętania |
+| 3. `Any` | Szybko, bez zmiany konfiguracji | Brak kontroli typów dla parametru |
+| 4. Override dla `tests.*` | Zero adnotacji w testach | Mypy nie weryfikuje typów parametrów |
+
+#### Typowe błędy mypy w testach
+
+| Komunikat | Przyczyna | Poprawka |
+|---|---|---|
+| `Function is missing a type annotation for one or more parameters` | Parametr testu (fixture lub z `parametrize`) bez typu | Dodać typ, np. `product: Product` |
+| `Function is missing a return type annotation` | Brak `-> None` | Dodać `-> None` |
+| `Skipping analyzing "shop.product": module is installed, but missing library stubs or py.typed marker` | Import `from shop.product import ...` zamiast `from src.shop.product import ...` | Importować ze ścieżką od katalogu głównego i trzymać jeden styl w całym projekcie |
+
+Mieszanie `shop.` i `src.shop.` jest ryzykowne: Python wczyta ten sam moduł pod dwiema nazwami,
+jako dwie osobne klasy, a mypy potraktuje zainstalowany pakiet jako bibliotekę bez typów.
+
+> Uwaga: plik z fixtures musi nazywać się **`conftest.py`**. Literówka (np. `contest.py`)
+> sprawia, że pytest go nie wczyta, a fixtures będą niewidoczne dla testów. Fixture lepiej też
+> nie nazywać `test_*` — w pliku z testami pytest wziąłby ją za test.
 
 ### Reguły ruff
 
