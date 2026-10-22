@@ -316,6 +316,130 @@ zostaje w tym pliku, w jednym katalogu trafia do jego `conftest.py`, a w całym 
 - **Jedna odpowiedzialność:** fixture buduje jeden obiekt. Złożone obiekty składaj z mniejszych
   fixtures (patrz wyżej, „Fixture zależna od innej fixture").
 
+### Hooki pytesta
+
+**Hook** to funkcja o ściśle określonej nazwie, którą **pytest sam wywołuje** w konkretnym
+momencie swojego działania (start, zbieranie testów, wykonanie testu, raport). Nie wywołujesz jej
+w testach ani nie wstrzykujesz — wystarczy zdefiniować funkcję o właściwej nazwie w `conftest.py`
+(albo we wtyczce), a pytest ją znajdzie i uruchomi.
+
+Nazwy hooków zaczynają się od `pytest_`. Literówka w nazwie z tym prefiksem nie przechodzi po cichu:
+pytest kończy się błędem `PluginValidationError: unknown hook 'pytest_colection_modifyitems'`.
+
+#### Hook a fixture
+
+| | Fixture | Hook |
+|---|---|---|
+| Kto wywołuje | pytest, gdy test poprosi o nią przez argument | pytest, automatycznie w ustalonym momencie |
+| Do czego | przygotować dane i zasoby dla testu | zmienić zachowanie samego pytesta |
+| Nazwa | dowolna | narzucona przez pytest |
+| Dostęp do testów | tylko do tego, który jej użył | do całej sesji, wszystkich zebranych testów i wyników |
+
+Zasada: **najpierw fixtures**, hooki dopiero gdy fixture nie wystarcza. Hook zmienia zachowanie
+pytesta globalnie, więc nadużywanie utrudnia zrozumienie, dlaczego test działa tak, a nie inaczej.
+
+#### Najważniejsze hooki w kolejności działania
+
+| Faza | Hook | Do czego |
+|---|---|---|
+| Start | `pytest_addoption` | dodać własną opcję linii poleceń (`--run-slow`) |
+| Start | `pytest_configure` | zarejestrować markery, ustawić konfigurację |
+| Zbieranie testów | `pytest_collection_modifyitems` | zmienić listę testów: pominąć, dodać marker, posortować |
+| Wykonanie | `pytest_runtest_setup` / `_call` / `_teardown` | zareagować przed, w trakcie i po teście |
+| Wynik | `pytest_runtest_makereport` | przechwycić wynik testu (np. zapisać logi przy porażce) |
+| Raport | `pytest_report_header`, `pytest_terminal_summary` | dopisać własne linie do raportu |
+| Koniec | `pytest_sessionfinish`, `pytest_unconfigure` | posprzątać po całej sesji |
+
+#### Przykład 1: automatyczny marker na podstawie katalogu
+
+Zamiast `@pytest.mark.unit` nad każdym testem, hook oznacza wszystkie testy z `tests/unit/`:
+
+```python
+# tests/conftest.py
+import pytest
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    for item in items:
+        if "unit" in item.path.parts:
+            item.add_marker(pytest.mark.unit)
+```
+
+Wtedy `pytest -m unit` wybiera wszystkie testy z tego katalogu. `item.path` to `pathlib.Path`
+pliku testu, a `items` można modyfikować (dodawać markery, usuwać elementy, zmieniać kolejność).
+
+#### Przykład 2: własna opcja `--run-slow`
+
+Wolne testy są domyślnie pomijane, a uruchamiasz je świadomie. Trzy hooki współpracują:
+
+```python
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption("--run-slow", action="store_true", default=False, help="run slow tests")
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "slow: tests that take a long time")
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if config.getoption("--run-slow"):
+        return
+    skip_slow = pytest.mark.skip(reason="need --run-slow option to run")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip_slow)
+```
+
+- `pytest_addoption` dodaje flagę, `pytest_configure` rejestruje marker (odpowiednik sekcji
+  `markers` w `pyproject.toml`), a `pytest_collection_modifyitems` pomija oznaczone testy.
+- Użycie w teście: `@pytest.mark.slow`. Domyślnie test jest pomijany (`pytest -rs` pokaże powód),
+  a `pytest --run-slow` uruchamia wszystko.
+
+#### Przykład 3: dopisek do nagłówka raportu
+
+```python
+def pytest_report_header(config: pytest.Config) -> str:
+    return "project: pytest-examples (shop)"
+```
+
+Zwrócony tekst pojawia się w nagłówku, obok wersji Pythona i pytesta.
+
+#### Przykład 4: reakcja na wynik testu (hook wrapper)
+
+`pytest_runtest_makereport` jako **wrapper** otacza domyślne zachowanie: `yield` zwraca gotowy raport,
+a po nim możesz zareagować. Przydatne np. do zapisania logów lub zrzutu ekranu przy porażce:
+
+```python
+from collections.abc import Generator
+from typing import Any
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[None]
+) -> Generator[None, Any, Any]:
+    report = yield
+    if report.when == "call" and report.failed:
+        print(f"\nFAILED: {item.nodeid}")
+    return report
+```
+
+`report.when` ma wartość `setup`, `call` lub `teardown`. Wrapper musi **zwrócić** raport.
+To zaawansowany wzorzec — na początku nauki zwykle niepotrzebny.
+
+#### Zasięg i zasady
+
+- **Adnotacje typów:** w mypy strict hooki wymagają adnotacji jak każda funkcja
+  (`pytest.Config`, `pytest.Item`, `pytest.Parser`, `-> None`).
+- **Zasięg:** `conftest.py` działa na testy ze swojego katalogu i podkatalogów. Hooki globalne, jak
+  `pytest_addoption`, umieszczaj w głównym `tests/conftest.py` (lub wtyczce) — opcje linii poleceń
+  są czytane, zanim pytest zbierze testy z podkatalogów.
+- **Kilka implementacji tego samego hooka** (w różnych plikach `conftest.py`) uruchamia się wszystkie,
+  nie tylko ostatnia.
+- **Podstawa wtyczek:** `pytest-cov` i `pytest-asyncio` to w dużej mierze zestawy hooków.
+  Sprawdzisz, jakie hooki wywołuje pytest, przez `pytest --trace-config`, a pełną listę z opisem
+  znajdziesz w dokumentacji „Hook reference".
+
 ### Named Tuple w testach
 
 Named tuple to krotka której pola mają nazwy. W testach używana do czytelnego
