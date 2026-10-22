@@ -625,6 +625,57 @@ async def test_health(wartosci):
 `parametrize` zarządza argumentami funkcji. `patch` jest wewnątrz — nie miesza się
 z argumentami. Zero konfliktu.
 
+### Czym jest context manager
+
+**Context manager** to obiekt, który mówi: „zrób coś przed wejściem do bloku `with` i coś po
+wyjściu z niego". Kod „po wyjściu" wykona się **zawsze**, także gdy w środku poleci wyjątek,
+dlatego context managery służą do zasobów, które trzeba zwolnić: pliki, połączenia, blokady.
+
+```python
+with open("data.txt") as file:      # wejście: plik otwarty
+    content = file.read()
+                                    # wyjście: plik zamknięty, nawet po błędzie
+```
+
+Przykłady, które pojawiają się w testach:
+
+| Context manager | Co robi |
+|---|---|
+| `open(...)` | otwiera i zamyka plik |
+| `smtplib.SMTP(...)`, `urlopen(...)` | zamykają połączenie |
+| `pytest.raises(...)` | łapie wyjątek i sprawdza go |
+| `patch(...)` | podmienia obiekt na czas bloku i przywraca go po wyjściu |
+
+#### Jak to działa pod spodem
+
+Obiekt ma dwie metody:
+
+- `__enter__` uruchamia się przy wejściu, a jej wynik trafia do zmiennej po `as`,
+- `__exit__` uruchamia się przy wyjściu, zawsze. Dostaje informację o wyjątku, a zwrócenie `True`
+  go „połyka" (tak działa `pytest.raises`, gdy wyjątek jest oczekiwany).
+
+Dlatego mock używany w `with` konfiguruje się przez
+`mock.return_value.__enter__.return_value` — to obiekt, który `with` dostaje w zmiennej po `as`.
+
+#### Własny context manager
+
+Najprościej przez dekorator `@contextmanager` i `yield`:
+
+```python
+from contextlib import contextmanager
+
+@contextmanager
+def opened_file(path):
+    file = open(path)
+    try:
+        yield file          # tu wykonuje się ciało bloku with
+    finally:
+        file.close()        # sprzątanie, zawsze
+```
+
+To ten sam schemat co **fixture z `yield`**: przygotowanie, `yield`, sprzątanie. Fixture to
+w istocie context manager zarządzany przez pytest.
+
 ### Kiedy fixture zamiast `patch` jako context manager?
 
 `patch` jako context manager wewnątrz funkcji — mock jest lokalny, tylko dla tego testu.
@@ -633,6 +684,56 @@ Fixture dla mocka ma sens tylko gdy:
 - Chcesz wydzielić setup mocka w jedno miejsce
 
 Gdy `parametrize` pokrywa wszystkie przypadki w jednej funkcji — fixture jest nadmiarowa.
+
+#### Dwie wersje obok siebie
+
+Context manager inline — patch widoczny tylko w bloku:
+
+```python
+def test_charge() -> None:
+    with patch("src.shop.payment.urlopen") as mock_urlopen:
+        ...
+        gateway.charge(25.0, "anna@example.com")
+    # po wyjściu z bloku patch jest już cofnięty
+```
+
+Fixture — patch aktywny w całym teście:
+
+```python
+@pytest.fixture
+def mock_urlopen() -> Iterator[MagicMock]:
+    with patch("src.shop.payment.urlopen") as mock:
+        yield mock          # patch trwa przez cały test, potem jest cofnięty
+
+
+def test_charge(mock_urlopen: MagicMock) -> None:
+    gateway.charge(25.0, "anna@example.com")
+```
+
+W fixture z `yield` patch musi być **wewnątrz** `with`. Gdyby `yield` stał po zakończeniu bloku,
+patch zostałby cofnięty, zanim test się zacznie.
+
+#### Tabela wyboru
+
+| Sytuacja | Wybór |
+|---|---|
+| Ten sam patch w **wielu różnych testach** | **fixture** |
+| Patch ma działać przez **cały test** (mniej wcięć) | **fixture** |
+| Mock jako **argument testu** z adnotacją typu | **fixture** |
+| Ustawienia mocka (`return_value`, `side_effect`) wspólne dla grupy testów | **fixture** |
+| Patch tylko dla **fragmentu testu** | **context manager** |
+| Przygotowanie obiektów wymaga prawdziwej funkcji, a mock ma działać dopiero potem | **context manager** |
+| Różne mocki w różnych fazach jednego testu | **context manager** |
+| Jednorazowy, krótki test lub test z `parametrize` pokrywającym wszystkie przypadki | **context manager** (lub dekorator) |
+
+#### Dekorator `@patch` i `monkeypatch`
+
+- **Dekorator `@patch`** to trzecia droga, ale przy `parametrize` łatwo pomylić kolejność
+  argumentów (patrz „Pułapka — `parametrize` + `patch` jako dekorator"). Fixture tego problemu nie
+  ma, bo mocki są wstrzykiwane po nazwie.
+- **`monkeypatch`** to wbudowana fixture pytesta: `monkeypatch.setattr("src.shop.payment.urlopen", fake)`.
+  Podmiana jest cofana automatycznie po teście, bez `with`. Dobra do prostych podmian, ale nie daje
+  mocka z asercjami typu `assert_called_once_with`.
 
 ---
 
