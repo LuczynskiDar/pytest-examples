@@ -1200,10 +1200,22 @@ def gateway() -> PaymentGateway:
 |---|---|---|
 | Odrzuca nieistniejące metody i atrybuty | tak | tak |
 | Sprawdza **sygnaturę** wywołań (liczbę i nazwy argumentów) | nie | tak |
-| Typ widziany przez mypy | `Mock` — niezgodny z parametrem `PaymentGateway` | `Any` — przechodzi |
+| Typ widziany przez mypy | `Mock` (dziedziczy po `Any`, więc pasuje do parametru `PaymentGateway`) | `Any` (pasuje do dowolnego typu) |
 
-Autospec łapie błędy w teście, np. `gateway.charge(1, 2, 3)` przy metodzie z dwoma argumentami, a
-przy okazji nie wymaga `cast` w trybie mypy strict.
+Autospec łapie błędy w teście, np. `gateway.charge(1, 2, 3)` przy metodzie z dwoma argumentami.
+
+**Mypy strict a fixture z mockiem:** `create_autospec` zwraca `Any`, więc fixture zadeklarowana jako
+`-> MagicMock` dostaje błąd `no-any-return`. Rozwiązanie to adnotacja zmiennej lokalnej, dzięki której
+mypy zna typ i w teście podpowiada `.charge.return_value`, a `MagicMock` nadal pasuje do parametru
+`PaymentGateway`:
+
+```python
+@pytest.fixture
+def gateway() -> MagicMock:
+    mock: MagicMock = create_autospec(PaymentGateway, instance=True)
+    mock.charge.return_value = "tx-1"
+    return mock
+```
 
 > Atrybuty ustawiane w `__init__` (np. `base_url`) nie należą do klasy, więc `spec` ich nie widzi
 > — odwołanie do nich w mocku rzuci `AttributeError`. Ustaw je ręcznie albo mockuj tylko metody.

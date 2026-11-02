@@ -1,7 +1,11 @@
 import csv
 import json
+import random
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 ProductData = tuple[str, float, int]
 CustomerData = tuple[str, str]
@@ -44,3 +48,38 @@ def read_json(path: str) -> Any:
 def write_json(path: str, json_data: Any) -> None:
     with Path(path).open("w", encoding="utf-8") as file:
         json.dump(json_data, file, indent=4, ensure_ascii=False)
+
+
+# Evaluation
+def greet(sender: Any, name: str) -> Any:
+    sender.send(f"Hello {name}")
+    return sender.status()
+
+
+def test_greet() -> None:
+    sender = MagicMock()
+    sender.status.return_value = "sent"
+
+    result = greet(sender, "Anna")
+
+    assert result == "sent"
+    sender.send.assert_called_once_with("Hello Anna")
+
+
+def test_greet_fail() -> None:
+    sender = MagicMock()
+    sender.send.side_effect = ConnectionError("Down")
+    with pytest.raises(ConnectionError, match="Down"):
+        greet(sender, "Anna")
+    sender.send.assert_called_once()
+
+
+def roll_dice() -> int:
+    return random.randint(1, 6)
+
+
+def test_roll_dice() -> None:
+    with patch("random.randint", return_value=4) as mock_randint:
+        assert roll_dice() == 4
+
+    mock_randint.assert_called_once_with(1, 6)
