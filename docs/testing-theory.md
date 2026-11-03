@@ -1306,6 +1306,153 @@ def test_send(mock_smtp: MagicMock) -> None:
     assert message["Subject"] == "Hi"
 ```
 
+#### Dlaczego `return_value.__enter__.return_value`
+
+Kod produkcyjny:
+
+```python
+with smtplib.SMTP(self.host, self.port) as server:
+    server.send_message(message)
+```
+
+Python rozbija `with ... as server` na trzy kroki:
+
+1. wywołuje `smtplib.SMTP(host, port)` i dostaje **obiekt**,
+2. woła na nim `__enter__()`,
+3. wynik `__enter__()` przypisuje do zmiennej po `as`, czyli do `server`.
+
+`server` to więc **wynik `__enter__`**, a nie obiekt z kroku 1. W prawdziwym `smtplib.SMTP` to ten sam
+obiekt, bo `__enter__` zwraca `self`. W mocku nie: `MagicMock` przy `__enter__` zwraca domyślnie
+**nowy, osobny mock**, więc trzeba do niego dojść tą samą drogą, którą idzie `with`.
+
+| W teście | W kodzie produkcyjnym |
+|---|---|
+| `mock_smtp` | `smtplib.SMTP` (klasa, patchowana) |
+| `mock_smtp.return_value` | wynik `smtplib.SMTP(host, port)` (krok 1) |
+| `mock_smtp.return_value.__enter__.return_value` | wynik `__enter__()`, czyli `server` (krok 3) |
+
+Częsty błąd — sprawdzanie metody na złym obiekcie:
+
+```python
+mock_smtp.return_value.send_message.assert_called_once()   # nie przejdzie
+```
+
+`send_message` jest wołane na `server`, a nie na obiekcie z kroku 1. Taki zapis działałby tylko
+w kodzie bez `with` (`server = smtplib.SMTP(host, port)`).
+
+**Skrót:** jeśli łańcuch jest uciążliwy, ustaw jawnie, żeby `__enter__` zwracał ten sam mock,
+jak w prawdziwej klasie:
+
+```python
+server = mock_smtp.return_value
+mock_smtp.return_value.__enter__.return_value = server
+```
+
+Wtedy `server.send_message` działa tak, jakby `__enter__` zwracał `self`.
+
+#### Skąd `call_args.args[0]`
+
+`send` buduje wiadomość **wewnątrz** siebie i przekazuje ją dalej:
+
+```python
+message = EmailMessage()
+message["To"] = recipient
+...
+server.send_message(message)
+```
+
+W teście nie masz referencji do `message`, ale mock zapamiętuje każde wywołanie razem z argumentami,
+więc obiekt można odzyskać:
+
+| Fragment | Co to jest |
+|---|---|
+| `server.send_message` | mock metody, na której kod zrobił `server.send_message(message)` |
+| `.call_args` | zapamiętane **ostatnie wywołanie** tej metody |
+| `.args` | krotka argumentów pozycyjnych tego wywołania |
+| `[0]` | pierwszy argument, czyli `message` |
+
+```python
+server.send_message.call_args.args      # (message,)
+server.send_message.call_args.args[0]   # message, czyli ten EmailMessage
+server.send_message.call_args.kwargs    # słownik argumentów nazwanych, np. {"from_addr": "x"}
+```
+
+Po odzyskaniu obiektu sprawdzasz jego prawdziwe pola (`message["To"]`, `message["Subject"]`).
+
+**Dlaczego nie `assert_called_once_with(...)`?** Użyjesz go, gdy masz obiekt do porównania. Tu go nie
+masz, a dwa różne obiekty `EmailMessage` nie są sobie równe (`==` porównuje tożsamość, nie
+zawartość), więc pobierasz argument i sprawdzasz jego pola ręcznie.
+
+Dla wielu wywołań jest `call_args_list` (lista wszystkich wywołań w kolejności), a `call_args` wskazuje
+zawsze na **ostatnie**. Metoda `message.get_content()` zwraca treść z `\n` na końcu, więc przy
+porównaniu użyj `.strip()`.
+
+#### Gdzie przypisać `server` — wewnątrz `with patch` czy po nim
+
+Obie opcje działają. `patch` podmienia tylko nazwę `smtplib.SMTP` na czas bloku, a sam mock
+(`mock_smtp`) i jego atrybuty istnieją dalej po wyjściu z bloku.
+
+**Po bloku** (zalecane, gdy tylko sprawdzasz wynik) — blok `with` zawiera wtedy tylko wywołanie
+testowanego kodu, a asercje są oddzielone od działania (wzorzec AAA):
+
+```python
+with patch("src.shop.notifications.smtplib.SMTP") as mock_smtp:
+    notifier.send(recipient, subject, body)
+
+server = mock_smtp.return_value.__enter__.return_value
+message = server.send_message.call_args.args[0]
+assert message["To"] == recipient
+```
+
+**Wewnątrz bloku** jest konieczne tylko wtedy, gdy trzeba coś **skonfigurować przed wywołaniem**
+kodu, np. wymusić błąd:
+
+```python
+with patch("src.shop.notifications.smtplib.SMTP") as mock_smtp:
+    server = mock_smtp.return_value.__enter__.return_value
+    server.send_message.side_effect = smtplib.SMTPException("down")
+    with pytest.raises(smtplib.SMTPException):
+        notifier.send(recipient, subject, body)
+```
+
+**Dlaczego dojście do `server` po bloku działa:** mock tworzy swoje dzieci (`return_value`,
+`__enter__`) przy pierwszym dostępie i je zapamiętuje. Kod produkcyjny dotknął tej samej ścieżki
+podczas `send`, więc po bloku dostajesz **ten sam** obiekt, na którym zarejestrowano wywołanie
+`send_message`.
+
+Zasada: konfiguracja mocka przed wywołaniem testowanego kodu, asercje po nim.
+
+#### Typowe błędy przy mockowaniu `SMTP`
+
+```python
+# źle
+with patch("src.shop.notifications.smtplib") as magic_mock:
+    notifier.send(recipient, subject, body)
+assert magic_mock.assert_called_once()
+assert magic_mock.assert_called_once_with(recipient, subject, body)
+```
+
+| Błąd | Skutek | Poprawka |
+|---|---|---|
+| Patch całego **modułu** `smtplib` zamiast klasy | `magic_mock` to moduł, a kod woła `magic_mock.SMTP(...)`, więc `assert_called_once()` widzi 0 wywołań (`Expected 'smtplib' to have been called once. Called 0 times`) | `patch("src.shop.notifications.smtplib.SMTP")` |
+| **`assert` przed** `assert_called_once()` | Metody `assert_called_*` same rzucają `AssertionError` i zwracają `None`, więc `assert None` zawsze pada | Wołaj je bez `assert`: `mock_smtp.assert_called_once()` |
+| Zły argument w `assert_called_once_with` | `SMTP` dostaje `(host, port)`, a odbiorca, temat i treść trafiają do `EmailMessage`, nie do konstruktora | `mock_smtp.assert_called_once_with("smtp.example.com", 25)` |
+
+Zawartość wiadomości sprawdzasz na obiekcie przekazanym do `send_message`:
+
+```python
+server = mock_smtp.return_value.__enter__.return_value
+message = server.send_message.call_args.args[0]
+
+assert message["To"] == recipient
+assert message["Subject"] == subject
+```
+
+**Host to sama nazwa serwera**: bez schematu (`smtp://`), bez portu i bez ukośników, np.
+`"smtp.example.com"` albo `"localhost"`. Port jest osobnym argumentem (`25`, `587`).
+W testach z mockiem wartość może być dowolna, ale warto użyć `example.com`, domeny zarezerwowanej
+na przykłady.
+
 ### Dodatkowe informacje o wywołaniach mocka
 
 | Atrybut | Co zwraca |
