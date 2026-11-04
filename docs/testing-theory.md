@@ -1328,6 +1328,164 @@ Nie mylić z odrzuceniem płatności: gdy serwer odpowie kodem 200 i `"status": 
 `raise_for_status()` nic nie rzuca. Dopiero kod sprawdza pole `status` w JSON i rzuca
 `PaymentError("Payment declined: ...")`.
 
+#### Jak czytać `mock_post.return_value.raise_for_status.side_effect = ...`
+
+Zapis to ścieżka przez obiekty, które kod produkcyjny wywołuje:
+
+```python
+response = requests.post(...)     # krok 1
+response.raise_for_status()       # krok 2
+```
+
+| Fragment | Co oznacza |
+|---|---|
+| `mock_post` | podmieniona funkcja `requests.post` |
+| `.return_value` | to, co zwraca `requests.post(...)`, czyli `response` |
+| `.raise_for_status` | metoda `response.raise_for_status` (mock tworzy ją sam przy pierwszym odwołaniu) |
+| `.side_effect = ...` | co ma się stać, gdy ta metoda zostanie **wywołana** |
+| `requests.HTTPError("500")` | wyjątek, który ma zostać rzucony |
+
+- `return_value = X` — wywołanie **zwraca** X,
+- `side_effect = SomeError(...)` — wywołanie **rzuca** wyjątek (instancja lub klasa).
+
+Przypisanie niczego nie wywołuje, to tylko konfiguracja. Wyjątek poleci dopiero, gdy `charge()`
+dojdzie do `response.raise_for_status()`. Argument `"500"` to tylko tekst komunikatu i nie ma
+związku z kodem statusu.
+
+#### Status code w mocku
+
+Kod produkcyjny nie czyta `status_code`, tylko woła `raise_for_status()`. Ustawienie
+`mock_post.return_value.status_code = 200` (lub `500`) **niczego nie zmienia**, bo `MagicMock` nie
+ma logiki, która by go sprawdzała. Służy co najwyżej jako opis w teście.
+
+| Symulowana sytuacja | Co ustawić |
+|---|---|
+| 200 (sukces) | nic (`raise_for_status` na `MagicMock` domyślnie nic nie robi) |
+| 4xx/5xx | `raise_for_status.side_effect = requests.HTTPError("500")` |
+
+Alternatywa to prawdziwy `requests.Response()` z ustawionym `status_code` (wtedy
+`raise_for_status()` działa naprawdę), ale dla odpowiedzi 200 trzeba ustawić prywatne `_content`,
+więc przy ćwiczeniu z mockami prostsza jest wersja z `side_effect`.
+
+#### Patchuj `requests.post`, a nie cały `requests`
+
+```python
+patch("src.shop.payment.requests")        # źle: podmienia też requests.RequestException
+patch("src.shop.payment.requests.post")   # dobrze: tylko to, co kod wywołuje
+```
+
+Gdy podmienisz cały moduł, `requests.RequestException` też staje się mockiem. Kod ma
+`except requests.RequestException`, a w `except` musi stać klasa wyjątku, więc przy teście błędu
+dostaniesz `TypeError: catching classes that do not inherit from BaseException`.
+
+Odpowiedź (`return_value`) musi być obiektem z metodami `json()` i `raise_for_status()`, a nie
+słownikiem. Słownik trafia do `return_value.json.return_value`.
+
+#### Hierarchia wyjątków `requests`
+
+`except requests.RequestException` łapie też `HTTPError`, bo `HTTPError` **dziedziczy** po
+`RequestException`. Blok `except` łapie wyjątek danej klasy oraz każdej jej podklasy.
+
+```
+Exception
+└── requests.RequestException
+    ├── requests.HTTPError
+    ├── requests.ConnectionError
+    │   └── requests.ConnectTimeout
+    ├── requests.Timeout
+    │   ├── requests.ConnectTimeout
+    │   └── requests.ReadTimeout
+    ├── requests.TooManyRedirects
+    └── ...
+```
+
+Sprawdzenie samemu:
+
+```python
+issubclass(requests.HTTPError, requests.RequestException)   # True
+requests.HTTPError.__mro__                                    # cała ścieżka dziedziczenia
+```
+
+Odwrotnie to nie działa: gdyby kod miał `except requests.HTTPError`, to `ConnectionError` by go
+ominął.
+
+#### Czy w `side_effect` można użyć `RequestException`?
+
+Można, test przejdzie. Lepiej jednak użyć konkretnej podklasy, bo:
+
+- **Intencja testu:** `HTTPError` to „serwer odpowiedział błędem", `ConnectionError` to „brak
+  połączenia", a `RequestException` mówi tylko „coś poszło nie tak".
+- **Zmiana kodu:** gdyby ktoś zawęził `except` do `HTTPError`, test z konkretną klasą nadal opisuje
+  realny przypadek.
+- **Realizm:** `requests` nigdy nie rzuca gołego `RequestException`, zawsze którąś z podklas.
+
+Dobrze pasuje `parametrize` — wszystkie trzy powinny dać to samo `PaymentError`, a test przy okazji
+potwierdza, że `except` obejmuje całą rodzinę:
+
+```python
+@pytest.mark.parametrize(
+    "error",
+    [requests.HTTPError("500"), requests.ConnectionError("down"), requests.Timeout("slow")],
+)
+def test_charge_gateway_unavailable(
+    correct_payment_gateway: PaymentGateway, error: requests.RequestException
+) -> None:
+    with patch("src.shop.payment.requests.post", side_effect=error):
+        with pytest.raises(PaymentError, match="unavailable"):
+            correct_payment_gateway.charge(25.0, "anna@example.com")
+```
+
+Dla `HTTPError` z `raise_for_status` wariant jest inny (`side_effect` ustawia się na
+`mock_post.return_value.raise_for_status`), więc w powyższym przykładzie `HTTPError` rzuca już
+samo `post`. Dla `PaymentGateway` wynik jest ten sam, bo oba wywołania stoją w tym samym `try`.
+
+#### `raise ... from error` — łańcuchowanie wyjątków
+
+Kod produkcyjny:
+
+```python
+except requests.RequestException as error:
+    raise PaymentError("Payment gateway unavailable") from error
+```
+
+- **`as error`** wiąże złapany wyjątek ze zmienną `error` (istnieje tylko wewnątrz `except`).
+- **`raise PaymentError(...) from error`** rzuca nowy wyjątek i jawnie wskazuje jego przyczynę.
+  Oryginał trafia do atrybutu `__cause__` nowego wyjątku.
+
+Kod wywołujący `charge()` widzi tylko `PaymentError` (własną abstrakcję, bez zależności od
+`requests`), a w tracebacku zostaje prawdziwa przyczyna:
+
+```
+requests.exceptions.ConnectionError: ... Connection refused
+
+The above exception was the direct cause of the following exception:
+
+src.shop.payment.PaymentError: Payment gateway unavailable
+```
+
+| Zapis | `__cause__` | Komunikat w tracebacku |
+|---|---|---|
+| `raise PaymentError(...) from error` | `error` | „was the **direct cause** of..." |
+| `raise PaymentError(...)` (w `except`) | `None` | „**During handling** of the above exception, another exception occurred" (sugeruje błąd w samej obsłudze) |
+| `raise PaymentError(...) from None` | `None` | oryginał jest ukryty (rzadko ma sens) |
+
+Bez `from` Python i tak dołącza oryginał (do `__context__`), ale komunikat wprowadza w błąd. Ruff
+z regułą `B` zgłasza taki brak jako **B904**, dlatego kod zawiera `from error`.
+
+**Sprawdzenie w teście**, że przyczyna została zachowana:
+
+```python
+error = requests.ConnectionError("down")
+with patch("src.shop.payment.requests.post", side_effect=error):
+    with pytest.raises(PaymentError, match="unavailable") as exc_info:
+        gateway.charge(25.0, "anna@example.com")
+
+assert exc_info.value.__cause__ is error
+```
+
+`exc_info.value` to złapany `PaymentError`, a `error` to ten sam obiekt, który został ustawiony
+w `side_effect`. Taka asercja pilnuje, żeby `from error` nie zostało przypadkiem usunięte.
+
 **Walidacja przed wywołaniem:** gdy kod odrzuca dane zanim sięgnie do sieci, sprawdź
 `mock_post.assert_not_called()`.
 
