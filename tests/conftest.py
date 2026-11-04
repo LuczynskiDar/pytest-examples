@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock, create_autospec
+
 import pytest
 from src.shop.cart import Cart
 from src.shop.customer import Customer
@@ -61,3 +63,16 @@ def payment_success_response() -> dict[str, str]:
 @pytest.fixture
 def payment_fail_response() -> dict[str, str]:
     return {"status": "declined", "reason": "insufficient_funds"}
+
+
+@pytest.fixture
+def mock_gateway() -> MagicMock:
+    mock: MagicMock = create_autospec(PaymentGateway, instance=True)
+    mock.charge.return_value = "tx-12345"
+    return mock
+
+
+@pytest.fixture
+def mock_notification() -> MagicMock:
+    mock: MagicMock = create_autospec(EmailNotifier, instance=True)
+    return mock
