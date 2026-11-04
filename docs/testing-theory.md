@@ -642,7 +642,7 @@ Przykłady, które pojawiają się w testach:
 | Context manager | Co robi |
 |---|---|
 | `open(...)` | otwiera i zamyka plik |
-| `smtplib.SMTP(...)`, `urlopen(...)` | zamykają połączenie |
+| `smtplib.SMTP(...)`, `requests.Session()` | zamykają połączenie |
 | `pytest.raises(...)` | łapie wyjątek i sprawdza go |
 | `patch(...)` | podmienia obiekt na czas bloku i przywraca go po wyjściu |
 
@@ -691,7 +691,7 @@ Context manager inline — patch widoczny tylko w bloku:
 
 ```python
 def test_charge() -> None:
-    with patch("src.shop.payment.urlopen") as mock_urlopen:
+    with patch("src.shop.payment.requests.post") as mock_post:
         ...
         gateway.charge(25.0, "anna@example.com")
     # po wyjściu z bloku patch jest już cofnięty
@@ -701,12 +701,12 @@ Fixture — patch aktywny w całym teście:
 
 ```python
 @pytest.fixture
-def mock_urlopen() -> Iterator[MagicMock]:
-    with patch("src.shop.payment.urlopen") as mock:
+def mock_post() -> Iterator[MagicMock]:
+    with patch("src.shop.payment.requests.post") as mock:
         yield mock          # patch trwa przez cały test, potem jest cofnięty
 
 
-def test_charge(mock_urlopen: MagicMock) -> None:
+def test_charge(mock_post: MagicMock) -> None:
     gateway.charge(25.0, "anna@example.com")
 ```
 
@@ -731,7 +731,7 @@ patch zostałby cofnięty, zanim test się zacznie.
 - **Dekorator `@patch`** to trzecia droga, ale przy `parametrize` łatwo pomylić kolejność
   argumentów (patrz „Pułapka — `parametrize` + `patch` jako dekorator"). Fixture tego problemu nie
   ma, bo mocki są wstrzykiwane po nazwie.
-- **`monkeypatch`** to wbudowana fixture pytesta: `monkeypatch.setattr("src.shop.payment.urlopen", fake)`.
+- **`monkeypatch`** to wbudowana fixture pytesta: `monkeypatch.setattr("src.shop.payment.requests.post", fake)`.
   Podmiana jest cofana automatycznie po teście, bez `with`. Dobra do prostych podmian, ale nie daje
   mocka z asercjami typu `assert_called_once_with`.
 
@@ -1247,50 +1247,89 @@ zmienił i że kolejne kroki (powiadomienie) się nie wykonały.
 
 ### Mockowanie wywołania z menedżerem kontekstu (`with ... as`)
 
-`urlopen` i `smtplib.SMTP` są używane jako `with urlopen(...) as response:`. `MagicMock`
+`smtplib.SMTP` jest używane jako `with smtplib.SMTP(...) as server:`. `MagicMock`
 obsługuje `__enter__` i `__exit__`, ale obiekt użyty w `with` to **`return_value.__enter__.return_value`**,
-a nie sam mock:
+a nie sam mock.
+
+### Mockowanie zapytań HTTP — `requests.post`
+
+`PaymentGateway` używa biblioteki `requests`. `requests.post(...)` **nie** jest context managerem,
+więc nie ma tu `__enter__`: odpowiedzią jest zwykły obiekt, a mock ustawia się przez
+`return_value`.
 
 ```python
-@patch("src.shop.payment.urlopen")
-def test_charge_approved(mock_urlopen: MagicMock) -> None:
-    response = mock_urlopen.return_value.__enter__.return_value
-    response.read.return_value = b'{"status": "approved", "transaction_id": "tx-1"}'
+@patch("src.shop.payment.requests.post")
+def test_charge_approved(mock_post: MagicMock) -> None:
+    mock_post.return_value.json.return_value = {"status": "approved", "transaction_id": "tx-1"}
 
     gateway = PaymentGateway("https://pay.example.com", "secret")
 
     assert gateway.charge(25.0, "anna@example.com") == "tx-1"
 ```
 
-- `patch("src.shop.payment.urlopen")` — patchujemy tam, gdzie nazwa jest **używana**
-  (`payment.py` robi `from urllib.request import urlopen`).
-- `json.load(response)` woła `response.read()`, więc wystarczy ustawić `read.return_value` na bajty.
+- `patch("src.shop.payment.requests.post")` — `payment.py` robi `import requests` i woła
+  `requests.post`, więc ścieżka to moduł, w którym nazwa jest **używana**, plus `requests.post`.
+- Kod robi `response.json()`, więc wystarczy ustawić `return_value.json.return_value` na słownik.
+- `response.raise_for_status()` na `MagicMock` nic nie robi (zwraca kolejny mock), więc w teście
+  szczęśliwej ścieżki nie trzeba go konfigurować.
 
-**Sprawdzanie, co zostało wysłane** — pierwszy argument `urlopen` to obiekt `Request`:
+**Sprawdzanie, co zostało wysłane** — `requests.post` dostaje URL pozycyjnie, a resztę jako
+argumenty nazwane, więc można je porównać wprost (nie ma obiektu `Request` do rozbierania):
 
 ```python
-request = mock_urlopen.call_args.args[0]
-
-assert request.full_url == "https://pay.example.com/charges"
-assert request.get_method() == "POST"
-assert request.get_header("Authorization") == "Bearer secret"
-assert json.loads(request.data) == {"amount": 25.0, "email": "anna@example.com"}
-assert mock_urlopen.call_args.kwargs["timeout"] == 5.0
+mock_post.assert_called_once_with(
+    "https://pay.example.com/charges",
+    json={"amount": 25.0, "email": "anna@example.com"},
+    headers={"Authorization": "Bearer secret"},
+    timeout=5.0,
+)
 ```
-
-Nagłówki są zapisywane z pierwszą wielką literą i resztą małych (`Content-type`), więc
-`get_header("Content-Type")` zwróci `None` — użyj `get_header("Content-type")`.
 
 **Błąd sieci:** `side_effect` z wyjątkiem zamiast `return_value`:
 
 ```python
-mock_urlopen.side_effect = URLError("connection refused")
+mock_post.side_effect = requests.ConnectionError("connection refused")
 with pytest.raises(PaymentError, match="unavailable"):
     gateway.charge(25.0, "anna@example.com")
 ```
 
+**Błąd HTTP (4xx/5xx):** to `raise_for_status()` rzuca wyjątek, więc to je trzeba skonfigurować:
+
+```python
+mock_post.return_value.raise_for_status.side_effect = requests.HTTPError("500")
+```
+
+#### Czym jest `response.raise_for_status()`
+
+Metoda sprawdza kod statusu HTTP odpowiedzi. Dla błędu rzuca `requests.HTTPError`, w przeciwnym
+razie nic nie robi.
+
+`requests.post(...)` rzuca wyjątek tylko wtedy, gdy nie da się połączyć z serwerem (brak sieci,
+timeout). Gdy serwer odpowie błędem, np. `500`, `requests` normalnie **zwraca** obiekt odpowiedzi
+i nic nie rzuca. Bez `raise_for_status()` kod poszedłby dalej i próbował czytać JSON z odpowiedzi
+błędu.
+
+| Kod statusu | Znaczenie | `raise_for_status()` |
+|---|---|---|
+| 2xx (np. 200, 201) | sukces | nic nie robi |
+| 3xx | przekierowanie | nic nie robi |
+| 4xx (np. 401, 404) | błąd klienta | rzuca `HTTPError` |
+| 5xx (np. 500, 503) | błąd serwera | rzuca `HTTPError` |
+
+W `PaymentGateway.charge` oba wywołania stoją w `try`, który łapie `requests.RequestException`.
+`HTTPError` jest jego podklasą, więc 4xx i 5xx dają ten sam wynik co brak połączenia:
+`PaymentError("Payment gateway unavailable")`. `raise_for_status()` musi stać **przed**
+`response.json()`.
+
+W teście na `MagicMock` ta metoda niczego nie robi (zwraca kolejny mock), więc błąd HTTP trzeba
+wymusić przez `side_effect`, jak wyżej.
+
+Nie mylić z odrzuceniem płatności: gdy serwer odpowie kodem 200 i `"status": "declined"`,
+`raise_for_status()` nic nie rzuca. Dopiero kod sprawdza pole `status` w JSON i rzuca
+`PaymentError("Payment declined: ...")`.
+
 **Walidacja przed wywołaniem:** gdy kod odrzuca dane zanim sięgnie do sieci, sprawdź
-`mock_urlopen.assert_not_called()`.
+`mock_post.assert_not_called()`.
 
 **SMTP:**
 
@@ -1464,7 +1503,7 @@ na przykłady.
 | `mock.reset_mock()` | czyści historię wywołań |
 
 `call_args.args[0]` jest potrzebne, gdy argumentem jest obiekt zbudowany wewnątrz testowanego
-kodu (jak `Request` czy `EmailMessage`) — nie możesz go porównać `assert_called_once_with`, bo nie
+kodu (jak `EmailMessage`) — nie możesz go porównać `assert_called_once_with`, bo nie
 masz do niego referencji.
 
 ### Sprawdzanie logów — `caplog`

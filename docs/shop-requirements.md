@@ -158,7 +158,7 @@ price or stock (the `Product` validation message is included in `<reason>`).
 ## Payment — `src/shop/payment.py`
 
 `PaymentGateway(base_url, api_key, timeout=5.0)` talks to an external service over HTTP using
-`urllib.request.urlopen`. **Tests must never make a real request — mock `urlopen`.**
+the `requests` library. **Tests must never make a real request — mock `requests.post`.**
 
 `charge(amount, customer_email) -> str` sends `POST <base_url>/charges` with a JSON body and a
 `Bearer` token, and returns the transaction id.
@@ -168,10 +168,11 @@ price or stock (the `Product` validation message is included in `<reason>`).
 | `amount <= 0` | `ValueError("Amount must be positive")`, no request is made |
 | Response `{"status": "approved", "transaction_id": ...}` | Returns the id as a string |
 | Response with another status | `PaymentError("Payment declined: <reason>")`, reason defaults to `unknown` |
-| `URLError` from `urlopen` | `PaymentError("Payment gateway unavailable")` |
+| `requests.RequestException` from `requests.post` (e.g. `ConnectionError`, `Timeout`) | `PaymentError("Payment gateway unavailable")` |
+| `raise_for_status()` raises `requests.HTTPError` (4xx/5xx) | `PaymentError("Payment gateway unavailable")` |
 
-Things to verify with a mock: the `Request` object passed to `urlopen` (URL, method, headers,
-body) and the `timeout` argument.
+Things to verify with a mock: the arguments passed to `requests.post` (URL, `json`, `headers`,
+`timeout`). The response is read with `response.json()`.
 
 ## Notifications — `src/shop/notifications.py`
 
@@ -210,8 +211,9 @@ constructor, so they are easy to replace with `Mock` / `MagicMock`.
 |---|---|
 | Replace a collaborator passed via the constructor | `Mock()` / `MagicMock()`; `Mock(spec=PaymentGateway)` rejects unknown attributes |
 | Make a call return a value or raise | `mock.charge.return_value = "tx-1"`, `mock.charge.side_effect = PaymentError("...")` |
-| Replace a name used inside a module | `patch("src.shop.payment.urlopen")` — patch where the name is **used**, not where it is defined |
-| Mock a context manager (`with urlopen(...) as r`) | Configure `mock.return_value.__enter__.return_value` |
+| Replace a name used inside a module | `patch("src.shop.payment.requests.post")` — patch where the name is **used**, not where it is defined |
+| Mock an HTTP response (`requests.post(...).json()`) | `mock_post.return_value.json.return_value = {...}` (no `__enter__` needed) |
+| Mock a context manager (`with smtplib.SMTP(...) as s`) | Configure `mock.return_value.__enter__.return_value` |
 | Check calls | `assert_called_once_with(...)`, `assert_not_called()`, `call_args`, `call_count` |
 | Check logging | `caplog` fixture (`caplog.at_level(logging.WARNING)`, `caplog.messages`) |
 | Create files for reader tests | `tmp_path`, then `(tmp_path / "x.csv").write_text(...)` |
@@ -243,7 +245,7 @@ Start from the classes with no dependencies and move up:
 4. `Order` — shipping cost threshold, status transitions, and the side effects of `pay()`.
 5. `readers` — txt, json and csv with files created in `tmp_path`.
 6. `ProductImporter` — real files from `tmp_path`; later, the same with `read_csv` mocked.
-7. `PaymentGateway` and `EmailNotifier` — mock `urlopen` and `smtplib.SMTP`.
+7. `PaymentGateway` and `EmailNotifier` — mock `requests.post` and `smtplib.SMTP`.
 8. `OrderService` — mock the gateway and the notifier; check calls, errors and logging.
 
 Layout:

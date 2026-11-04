@@ -1,6 +1,4 @@
-import json
-from urllib.error import URLError
-from urllib.request import Request, urlopen
+import requests
 
 
 class PaymentError(Exception):
@@ -24,19 +22,16 @@ class PaymentGateway:
         if amount <= 0:
             raise ValueError("Amount must be positive")
 
-        request = Request(
-            f"{self.base_url}/charges",
-            data=json.dumps({"amount": amount, "email": customer_email}).encode(),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
         try:
-            with urlopen(request, timeout=self.timeout) as response:
-                result = json.load(response)
-        except URLError as error:
+            response = requests.post(
+                f"{self.base_url}/charges",
+                json={"amount": amount, "email": customer_email},
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            result = response.json()
+        except requests.RequestException as error:
             raise PaymentError("Payment gateway unavailable") from error
 
         if result.get("status") != "approved":

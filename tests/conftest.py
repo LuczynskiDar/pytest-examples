@@ -3,6 +3,7 @@ from src.shop.cart import Cart
 from src.shop.customer import Customer
 from src.shop.notifications import EmailNotifier
 from src.shop.order import Order
+from src.shop.payment import PaymentGateway
 from src.shop.product import Product
 
 
@@ -45,3 +46,18 @@ def user_cart(correct_product: Product) -> Cart:
 @pytest.fixture
 def correct_order(correct_customer: Customer, user_cart: Cart) -> Order:
     return Order(correct_customer, user_cart)
+
+
+@pytest.fixture
+def correct_payment_gateway() -> PaymentGateway:
+    return PaymentGateway("api.example.com/payment/", "sh-test-secret-bearer", 3.0)
+
+
+@pytest.fixture
+def payment_success_response() -> dict[str, str]:
+    return {"status": "approved", "transaction_id": "tx-12345"}
+
+
+@pytest.fixture
+def payment_fail_response() -> dict[str, str]:
+    return {"status": "declined", "reason": "insufficient_funds"}
